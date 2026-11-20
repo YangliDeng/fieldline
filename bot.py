@@ -39,6 +39,22 @@ def bearing(a, b):
     return math.atan2(b[1] - a[1], b[0] - a[0])
 
 
+def aligned_at(me, aim, shot, elapsed):
+    yaw, pitch = me["aim"]
+    yaw_step = elapsed * me["stats"]["turn_rate"]
+    pitch_step = elapsed * me["stats"]["pitch_rate"]
+    yaw += clamp(angle_delta(aim[0], yaw), -yaw_step, yaw_step)
+    pitch += clamp(aim[1] - pitch, -pitch_step, pitch_step)
+    shot_yaw, shot_pitch, tolerance, _ = shot
+    return abs(angle_delta(shot_yaw, yaw)) <= tolerance[0] and abs(shot_pitch - pitch) <= tolerance[1]
+
+
+def laser_charge_goal(values, actor, retreat):
+    if retreat or actor.get("hp", math.inf) < values["damage"] * values["min_frac"] * 0.85:
+        return values["min_charge"]
+    return values["charge"]
+
+
 def zone_at(obs, time):
     zone = obs["zone"]
     remaining = zone["shrink_end"] - max(obs["t"], zone["shrink_start"])
@@ -108,6 +124,7 @@ class Bot:
         self.arena = Arena(hello["map"]["dir"])
         self.config = hello["config"]
         self.physics_step = 1 / self.config["match"]["tick_hz"]
+        self.decision_time = self.physics_step * self.config["match"]["decide_every"]
         self.side = 1 if hello["seed"] % 2 else -1
         self.last_damage = -100.0
         self.damage_bearing = None
@@ -299,6 +316,13 @@ class Bot:
         speed = 1.0 if close or retreat or urgent or travel >= 6 else clamp(travel / 6, 0.35, 1.0)
         return [speed * vector[0], speed * vector[1]], boost, jump
 
+    def firing_time(self, weapon):
+        # A cooling weapon can start firing after the torso has turned one more tick.
+        wait = max(weapon["cooldown"], weapon.get("reload", 0.0))
+        if weapon["kind"] != "laser" and self.physics_step + 1e-6 < wait < self.decision_time:
+            return self.physics_step * math.ceil((wait - 1e-6) / self.physics_step)
+        return self.physics_step
+
     def shot(self, me, actor, weapon):
         stats, config = me["stats"], self.config
         kind = weapon["kind"]
@@ -308,7 +332,8 @@ class Bot:
         muzzle = stats["height"] + 0.5 if kind == "mortar" else stats["muzzle_height"]
         origin = origin[0], origin[1], origin[2] + muzzle
         velocity = actor.get("vel", (0, 0, 0))
-        target = tuple(actor["pos"][i] + self.physics_step * velocity[i] for i in range(3))
+        elapsed = self.firing_time(weapon)
+        target = tuple(actor["pos"][i] + elapsed * velocity[i] for i in range(3))
         target = target[0], target[1], target[2] + 0.54 * height
         gap = math.dist(origin, target)
         if gap > values.get("range", 206) or (kind == "mortar" and gap < 21):
@@ -354,7 +379,6 @@ class Bot:
         ))
 
         weapons = me["weapons"]
-        decision_time = self.physics_step * self.config["match"]["decide_every"]
         for actor in actors[:6]:
             if perf_counter() >= deadline:
                 break
@@ -368,32 +392,41 @@ class Bot:
                 weapon, values = weapons[index], plan[3]
                 energy_ok = me["energy"] >= values.get("energy", 0) + (17 if retreat else 0)
                 loaded = weapon["kind"] != "gun" or weapon.get("ammo", 0) > 0
-                ready = weapon["cooldown"] <= decision_time and weapon.get("reload", 0) <= decision_time
+                ready = weapon["cooldown"] < self.decision_time and weapon.get("reload", 0) < self.decision_time
                 charging = weapon.get("charge", 0) > 0
                 priorities.append((charging, ready and energy_ok and loaded, WEAPON_VALUE[weapon["kind"]], index))
-            _, _, _, primary = max(priorities)
-            yaw, pitch, _, _ = plans[primary]
-            yaw_step = self.physics_step * stats["turn_rate"]
-            pitch_step = self.physics_step * stats["pitch_rate"]
-            actual_yaw = me["aim"][0] + clamp(angle_delta(yaw, me["aim"][0]), -yaw_step, yaw_step)
-            actual_pitch = me["aim"][1] + clamp(pitch - me["aim"][1], -pitch_step, pitch_step)
+            charging, _, _, primary = max(priorities)
+            laser_slot = primary if charging else None
+            if laser_slot is not None:
+                laser_plan = plans[laser_slot]
+                laser_goal = laser_charge_goal(laser_plan[3], actor, retreat)
+                gun_slot = 1 - laser_slot
+                gun, gun_plan = weapons[gun_slot], plans[gun_slot]
+                if (
+                    laser_goal - weapons[laser_slot]["charge"] > self.decision_time + 1e-6
+                    and gun_plan is not None and gun["kind"] == "gun" and gun.get("ammo", 0) > 0
+                    and max(gun["cooldown"], gun.get("reload", 0)) < self.decision_time
+                    and abs(angle_delta(gun_plan[0], laser_plan[0])) < self.physics_step * stats["turn_rate"]
+                    and abs(gun_plan[1] - laser_plan[1]) < self.physics_step * stats["pitch_rate"]
+                    and aligned_at(me, gun_plan[:2], gun_plan, self.firing_time(gun))
+                ):
+                    primary = gun_slot
+            yaw, pitch = plans[primary][:2]
             fire = [False, False]
             for index, plan in enumerate(plans):
                 if plan is None:
                     continue
-                shot_yaw, shot_pitch, tolerance, values = plan
+                values = plan[3]
                 weapon = weapons[index]
-                aligned = abs(angle_delta(shot_yaw, actual_yaw)) <= tolerance[0] and abs(shot_pitch - actual_pitch) <= tolerance[1]
+                aligned = aligned_at(me, (yaw, pitch), plan, self.firing_time(weapon))
                 if weapon["kind"] == "laser":
                     charge = weapon.get("charge", 0.0)
-                    target_charge = values["min_charge"] if retreat else values["charge"]
-                    if actor.get("hp", math.inf) < values["damage"] * values["min_frac"] * 0.85:
-                        target_charge = values["min_charge"]
-                    fire[index] = index == primary and weapon["cooldown"] < 0.08 and (
+                    target_charge = laser_charge_goal(values, actor, retreat)
+                    fire[index] = (index == primary or index == laser_slot) and weapon["cooldown"] < 0.08 and (
                         charge > 0 or abs(angle_delta(yaw, me["aim"][0])) < 0.48
                     ) and not (aligned and charge >= target_charge - 0.025)
                 else:
-                    fire[index] = aligned and weapon["cooldown"] < 0.1 and (
+                    fire[index] = aligned and max(weapon["cooldown"], weapon.get("reload", 0)) < self.decision_time and (
                         me["energy"] >= values.get("energy", 0) + (17 if retreat else 0)
                     )
             self.target_id = actor["id"]
