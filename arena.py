@@ -135,15 +135,38 @@ class Arena:
 
     def next_waypoint(self, pos, goal, radius, height, step_up, deadline):
         """A bounded A* search returns useful partial routes for distant goals."""
-        start = round(pos[0] / CELL), round(pos[1] / CELL)
+        rounded = round(pos[0] / CELL), round(pos[1] / CELL)
+        start = rounded
         target = round(goal[0] / CELL), round(goal[1] / CELL)
         if start == target:
             return goal
         width = math.ceil(radius * 2) / 2
         height = math.ceil(height)
+
+        def reachable(waypoint):
+            dx, dy = waypoint[0] - pos[0], waypoint[1] - pos[1]
+            length = math.hypot(dx, dy)
+            return length == 0.0 or self.walk_clearance(
+                pos, (dx / length, dy / length), radius, height, step_up, length
+            ) >= length
+
         initial = self.grid_height(*start, width, height)
         if initial is None or abs(initial - pos[2]) > 2.0:
-            return goal
+            if abs(self.ground(*pos[:2]) - pos[2]) > 2.0:
+                return goal
+            nearby = sorted(
+                ((rounded[0] + dx, rounded[1] + dy) for dx, dy in NEIGHBORS),
+                key=lambda node: (node[0] * CELL - pos[0]) ** 2 + (node[1] * CELL - pos[1]) ** 2,
+            )
+            for node in nearby:
+                if perf_counter() >= deadline:
+                    return goal
+                z = self.grid_height(*node, width, height)
+                if z is not None and abs(z - pos[2]) <= 2.0 and reachable((node[0] * CELL, node[1] * CELL)):
+                    start = node
+                    break
+            else:
+                return goal
 
         def remaining(node):
             return math.hypot(node[0] - target[0], node[1] - target[1])
@@ -151,15 +174,14 @@ class Arena:
         frontier = [(remaining(start), 0.0, start)]
         costs = {start: 0.0}
         parents = {}
-        best = start
+        best = None
+        best_remaining = math.inf
         for _ in range(185):
             if not frontier or perf_counter() >= deadline:
                 break
             _, cost, current = heappop(frontier)
             if cost != costs[current]:
                 continue
-            if remaining(current) < remaining(best):
-                best = current
             if current == target:
                 break
             z = self.grid_height(*current, width, height)
@@ -180,19 +202,20 @@ class Arena:
                 if self.blocked(*midpoint, self.ground(*midpoint), width, height):
                     continue
                 costs[neighbor], parents[neighbor] = next_cost, current
-                heappush(frontier, (next_cost + 1.16 * remaining(neighbor), next_cost, neighbor))
+                estimate = remaining(neighbor)
+                if estimate < best_remaining:
+                    best, best_remaining = neighbor, estimate
+                heappush(frontier, (next_cost + 1.16 * estimate, next_cost, neighbor))
 
-        if best == start:
-            return goal
+        if best is None:
+            return (start[0] * CELL, start[1] * CELL) if start != rounded else goal
         route = []
         while best != start:
             route.append((best[0] * CELL, best[1] * CELL))
             best = parents[best]
+        if start != rounded:
+            route.append((start[0] * CELL, start[1] * CELL))
         for waypoint in route[-6:]:
-            dx, dy = waypoint[0] - pos[0], waypoint[1] - pos[1]
-            distance = math.hypot(dx, dy)
-            if distance > 1.2 and self.walk_clearance(
-                pos, (dx / distance, dy / distance), radius, height, step_up, distance
-            ) >= distance:
+            if math.hypot(waypoint[0] - pos[0], waypoint[1] - pos[1]) > 1.2 and reachable(waypoint):
                 return waypoint
         return route[-1]
