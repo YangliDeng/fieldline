@@ -2,4 +2,5 @@
 !Dockerfile
 !arena.py
 !bot.py
+!combat.py
 !mechfight.py

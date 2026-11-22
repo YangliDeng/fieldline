@@ -14,6 +14,7 @@ from time import perf_counter
 TILE = 24
 CELL = 5
 NEIGHBORS = ((1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (1, -1), (-1, 1), (-1, -1))
+ANCHOR_ANGLES = tuple(math.radians(degrees) for degrees in (0, 30, -30, 60, -60, 90, -90, 125, -125, 180))
 
 
 def contains(edges, x, y):
@@ -127,6 +128,74 @@ class Arena:
             previous = feet
         return distance
 
+    def can_walk_to(self, pos, goal, width, height, step_up):
+        dx, dy = goal[0] - pos[0], goal[1] - pos[1]
+        length = math.hypot(dx, dy)
+        return length == 0.0 or self.walk_clearance(
+            pos, (dx / length, dy / length), width, height, step_up, length
+        ) >= length
+
+    def safe_anchor(self, pos, goal, center, zone_radius, radius, height, step_up, threat_origins, deadline):
+        """Find a traversable zone destination, or nearby cover from known pursuers."""
+        x, y = pos[:2]
+        goal = tuple(goal[:2])
+        center = tuple(center[:2])
+        initial_goal_gap = math.hypot(x - goal[0], y - goal[1])
+        threats = tuple(threat_origins)[:2]
+        ahead = math.atan2(goal[1] - y, goal[0] - x)
+        if threats and initial_goal_gap < 7.0:
+            closest = min(threats, key=lambda origin: math.hypot(x - origin[0], y - origin[1]))
+            ahead = math.atan2(y - closest[1], x - closest[0])
+        candidates = [goal]
+        if threats:
+            candidates.extend(
+                (x + length * math.cos(ahead + offset), y + length * math.sin(ahead + offset))
+                for length in (9.0, 17.0, 26.0)
+                for offset in ANCHOR_ANGLES
+            )
+        else:
+            # A ring can close around a solid footprint. Check both finer and wider offsets.
+            candidates.append(center)
+            candidates.extend(
+                (goal[0] + length * math.cos(offset), goal[1] + length * math.sin(offset))
+                for length in (2.0, 5.0, 10.0, 18.0)
+                for offset in ANCHOR_ANGLES
+            )
+
+        clearance_radius = max(0.0, zone_radius - min(3.0, 0.18 * zone_radius))
+        threat_gaps = [math.hypot(x - origin[0], y - origin[1]) for origin in threats]
+
+        def base_score(point):
+            dx, dy = point[0] - x, point[1] - y
+            remaining = math.hypot(point[0] - goal[0], point[1] - goal[1])
+            outside = max(0.0, math.hypot(point[0] - center[0], point[1] - center[1]) - clearance_radius)
+            score = 0.8 * (initial_goal_gap - remaining) - 0.07 * math.hypot(dx, dy) - 4.0 * outside
+            for origin, previous_gap in zip(threats, threat_gaps):
+                gap = math.hypot(point[0] - origin[0], point[1] - origin[1])
+                score += 0.7 * (gap - previous_gap) - 2.0 * max(0.0, 14.0 - gap)
+            return score
+
+        best_score, best = -math.inf, goal
+        for score, point in sorted(((base_score(point), point) for point in candidates), reverse=True):
+            if perf_counter() >= deadline or score + 19.0 * len(threats) < best_score:
+                break
+            px, py = point
+            trip = math.hypot(px - x, py - y)
+            feet = self.ground(px, py)
+            if self.blocked(px, py, feet, radius, height):
+                continue
+            if threats and (not 4.0 <= trip < 31.0 or not self.can_walk_to(pos, point, radius, height, step_up)):
+                continue
+            torso = px, py, feet + 0.65 * height
+            for origin in threats:
+                if perf_counter() >= deadline:
+                    break
+                if not self.clear_shot(origin, torso):
+                    score += 19.0
+            if score > best_score:
+                best_score, best = score, point
+        return best
+
     @lru_cache(maxsize=12_000)
     def grid_height(self, i, j, width, height):
         x, y = i * CELL, j * CELL
@@ -135,7 +204,8 @@ class Arena:
 
     def next_waypoint(self, pos, goal, radius, height, step_up, deadline):
         """A bounded A* search returns useful partial routes for distant goals."""
-        start = round(pos[0] / CELL), round(pos[1] / CELL)
+        rounded = round(pos[0] / CELL), round(pos[1] / CELL)
+        start = rounded
         target = round(goal[0] / CELL), round(goal[1] / CELL)
         if start == target:
             return goal
@@ -143,7 +213,22 @@ class Arena:
         height = math.ceil(height)
         initial = self.grid_height(*start, width, height)
         if initial is None or abs(initial - pos[2]) > 2.0:
-            return goal
+            if abs(self.ground(*pos[:2]) - pos[2]) > 2.0:
+                return goal
+            nearby = sorted(
+                ((rounded[0] + dx, rounded[1] + dy) for dx, dy in NEIGHBORS),
+                key=lambda node: (node[0] * CELL - pos[0]) ** 2 + (node[1] * CELL - pos[1]) ** 2,
+            )
+            for node in nearby:
+                if perf_counter() >= deadline:
+                    return goal
+                z = self.grid_height(*node, width, height)
+                point = node[0] * CELL, node[1] * CELL
+                if z is not None and abs(z - pos[2]) <= 2.0 and self.can_walk_to(pos, point, radius, height, step_up):
+                    start = node
+                    break
+            else:
+                return goal
 
         def remaining(node):
             return math.hypot(node[0] - target[0], node[1] - target[1])
@@ -151,15 +236,14 @@ class Arena:
         frontier = [(remaining(start), 0.0, start)]
         costs = {start: 0.0}
         parents = {}
-        best = start
+        best = None
+        best_remaining = math.inf
         for _ in range(185):
             if not frontier or perf_counter() >= deadline:
                 break
             _, cost, current = heappop(frontier)
             if cost != costs[current]:
                 continue
-            if remaining(current) < remaining(best):
-                best = current
             if current == target:
                 break
             z = self.grid_height(*current, width, height)
@@ -180,19 +264,21 @@ class Arena:
                 if self.blocked(*midpoint, self.ground(*midpoint), width, height):
                     continue
                 costs[neighbor], parents[neighbor] = next_cost, current
-                heappush(frontier, (next_cost + 1.16 * remaining(neighbor), next_cost, neighbor))
+                estimate = remaining(neighbor)
+                if estimate < best_remaining:
+                    best, best_remaining = neighbor, estimate
+                heappush(frontier, (next_cost + 1.16 * estimate, next_cost, neighbor))
 
-        if best == start:
-            return goal
+        if best is None:
+            return (start[0] * CELL, start[1] * CELL) if start != rounded else goal
         route = []
         while best != start:
             route.append((best[0] * CELL, best[1] * CELL))
             best = parents[best]
+        if start != rounded:
+            route.append((start[0] * CELL, start[1] * CELL))
         for waypoint in route[-6:]:
             dx, dy = waypoint[0] - pos[0], waypoint[1] - pos[1]
-            distance = math.hypot(dx, dy)
-            if distance > 1.2 and self.walk_clearance(
-                pos, (dx / distance, dy / distance), radius, height, step_up, distance
-            ) >= distance:
+            if math.hypot(dx, dy) > 1.2 and self.can_walk_to(pos, waypoint, radius, height, step_up):
                 return waypoint
         return route[-1]

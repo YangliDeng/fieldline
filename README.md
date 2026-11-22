@@ -2,7 +2,7 @@
 
 Fieldline is a placement-first Python bot for Builders’ Mech Royale. It forecasts the shrinking zone, routes around arena geometry, collects nearby loot, and uses weapon-specific aiming. It reads the mounted arena at startup. The image uses only the Python standard library and can run as UID 65534 with a read-only filesystem.
 
-`mechfight.py` is the transport wrapper from the official Mech Royale starter kit. The bot and arena logic are in `bot.py` and `arena.py`.
+`mechfight.py` is the transport wrapper from the official Mech Royale starter kit. `bot.py` handles objectives, gear, and movement. `combat.py` selects targets and firing solutions. `arena.py` handles terrain, cover, and routes.
 
 ## Windows protocol check
 
